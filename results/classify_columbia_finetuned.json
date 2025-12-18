@@ -1,0 +1,9 @@
+{
+  "metrics": {
+    "accuracy": NaN,
+    "f1": 0.0,
+    "recall_tampered": 0.0,
+    "auc": null
+  },
+  "per_image": []
+}
