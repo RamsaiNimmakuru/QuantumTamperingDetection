@@ -1,0 +1,315 @@
+# scripts/pipeline_restore_and_classify.py
+"""
+Pipeline: restoration -> classification -> evaluation
+
+Usage (examples):
+python3 scripts/pipeline_restore_and_classify.py \
+  --restore-ckpt models/restoration_best_pretrain.pt \
+  --vgg-ckpt vgg16_baseline.pt \
+  --input-folder data/raw/CASIA/Tp \
+  --out-restored results/restored_casia_tp \
+  --labels-csv data/labels_casia_test.csv
+
+If --labels-csv is not provided, the script will try to infer labels from a dataset root
+by looking for common tampered/authentic folder names (Tp, Gt, tampered, authentic, tampered_images, real).
+"""
+
+import os
+import argparse
+import json
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import torch
+import torchvision.transforms as T
+from PIL import Image
+import numpy as np
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, f1_score, recall_score, roc_auc_score
+
+# ---- Safe conversion helper (paste near other imports) ----
+from PIL import Image
+import numpy as np
+import torch
+
+def to_pil_image_safe(img):
+    """
+    Convert Tensor / ndarray / PIL.Image to PIL.Image safely.
+    Handles:
+      - PIL.Image.Image -> returns as-is
+      - torch.Tensor -> cpu(), detach(), (C,H,W) or (1,C,H,W) -> HxWxC, scaled/clamped
+      - numpy.ndarray -> HxWxC or CxHxW -> Image.fromarray
+    Returns a PIL.Image.Image
+    """
+    # Already a PIL image
+    if isinstance(img, Image.Image):
+        return img
+
+    # Torch tensor
+    if isinstance(img, torch.Tensor):
+        t = img.detach().cpu()
+        # squeeze batch dim if present (1,C,H,W)
+        if t.ndim == 4 and t.shape[0] == 1:
+            t = t.squeeze(0)
+        # If shape is (C,H,W) -> (H,W,C)
+        if t.ndim == 3:
+            t = t.permute(1, 2, 0).numpy()
+        else:
+            t = t.numpy()
+
+        # Floats assumed in [0,1] -> convert to uint8
+        if np.issubdtype(t.dtype, np.floating):
+            t = np.clip(t, 0.0, 1.0)
+            t = (t * 255.0).round().astype(np.uint8)
+        else:
+            if t.dtype != np.uint8:
+                t = t.astype(np.uint8)
+
+        # If grayscale (H,W) keep, else assume (H,W,C)
+        return Image.fromarray(t)
+
+    # numpy array
+    if isinstance(img, np.ndarray):
+        arr = img
+        # If channel-first (C,H,W) convert to H,W,C
+        if arr.ndim == 3 and arr.shape[0] in (1, 3):
+            arr = np.transpose(arr, (1, 2, 0))
+        # floats -> [0,1] to uint8
+        if np.issubdtype(arr.dtype, np.floating):
+            arr = np.clip(arr, 0.0, 1.0)
+            arr = (arr * 255.0).round().astype(np.uint8)
+        if arr.dtype != np.uint8:
+            arr = arr.astype(np.uint8)
+        return Image.fromarray(arr)
+
+    raise TypeError(f"to_pil_image_safe: unsupported type {type(img)}")
+# ---- end helper ----
+
+# ---- Helper utilities ----
+def device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def safe_load_ckpt(path):
+    path = str(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    try:
+        ckpt = torch.load(path, map_location="cpu")
+        return ckpt
+    except Exception as e:
+        # try loading with torch.jit if saved as script module
+        raise RuntimeError(f"Failed to load checkpoint {path}: {e}")
+
+def safe_auc(y_true, y_score):
+    try:
+        if len(set(y_true)) < 2:  # only one class present
+            return None
+        return float(roc_auc_score(y_true, y_score))
+    except Exception:
+        return None
+
+# ---- Model loaders (best-effort, replace with your classes if available) ----
+def load_restoration_model(ckpt_path: str, dev: torch.device):
+    """
+    Attempts to load a restoration model. If the repo contains a model class
+    (model_unet.py or models_restoration.py) this function will try to import and instantiate it.
+    If not, it returns None and the script will do a pass-through copy (so pipeline still runs).
+    """
+    ckpt = safe_load_ckpt(ckpt_path)
+    # Heuristics: if contains 'model_state' or 'state_dict', return state_dict
+    for k in ("model_state", "state_dict"):
+        if k in ckpt:
+            return {"type": "state_dict", "state": ckpt[k]}
+    # If it's a traced/script module, user may need to adapt. We'll return raw ckpt.
+    return {"type": "raw", "state": ckpt}
+
+def load_vgg_model(ckpt_path: str, dev: torch.device):
+    """
+    Attempts to load VGG classifier. If model_vgg.py exists, tries to instantiate VGG and load state.
+    Otherwise returns the raw state dict (user must adapt).
+    """
+    ckpt = safe_load_ckpt(ckpt_path)
+    for k in ("model_state", "state_dict"):
+        if k in ckpt:
+            return {"type": "state_dict", "state": ckpt[k]}
+    return {"type": "raw", "state": ckpt}
+
+# ---- Inference helpers ----
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
+
+def run_restoration_inference(input_folder: str, out_folder: str, restore_model_info, img_size=(256,256)):
+    """
+    If a proper model class is not available, this function will fallback to copying/resizing images
+    to out_folder so the rest of the pipeline can still run.
+    If you have a restoration class, replace the inference part with the model forward pass.
+    """
+    ensure_dir(out_folder)
+    files = sorted([f for f in os.listdir(input_folder) if f.lower().endswith((".png",".jpg",".jpeg"))])
+    if len(files) == 0:
+        print(f"[restore] No images found in {input_folder}")
+        return []
+    transform = T.Compose([T.Resize(img_size)])
+    print(f"[restore] Found {len(files)} images in {input_folder}. Running restoration (fallback/pass-through).")
+    out_files = []
+    for fn in files:
+        inp = Image.open(os.path.join(input_folder, fn)).convert("RGB")
+        # If you implement a real model: run model(transform(inp).unsqueeze(0).to(device())) etc.
+        restored = transform(inp)
+        # convert back to PIL for saving
+        # If restored may already be PIL or numpy or tensor, convert safely:
+        try:
+            restored_pil = to_pil_image_safe(restored)
+        except Exception as e:
+    # fallback + helpful debug
+            print(f"[restore] to_pil_image_safe failed for type {type(restored)}: {e}")
+    # If it's already a PIL.Image this will re-raise less likely, but as a final safe fallback:
+            if isinstance(restored, Image.Image):
+                restored_pil = restored
+            else:
+                raise
+
+        out_path = os.path.join(out_folder, fn)
+        restored_pil.save(out_path)
+        arr = np.asarray(restored_pil).astype(np.float32)
+        # quick check
+        if np.isnan(arr).any():
+            print(f"[restore] WARNING: NaN values in restored output for {fn}")
+        out_files.append(fn)
+    return out_files
+
+def predict_folder_with_vgg(model_info, folder: str, img_size=(224,224)):
+    """
+    Placeholder predictor. If you have an actual VGG class, replace this function's internals
+    with proper model instantiation and forward pass that returns probability for 'tampered' class.
+    """
+    files = sorted([f for f in os.listdir(folder) if f.lower().endswith((".png",".jpg",".jpeg"))])
+    transform = T.Compose([T.Resize(img_size), T.ToTensor()])
+    results = []
+    for fn in tqdm(files, desc=f"[vgg] predict {os.path.basename(folder)}"):
+        path = os.path.join(folder, fn)
+        img = Image.open(path).convert("RGB")
+        # Replace next three lines with `prob = model_forward(...)`
+        prob = 0.5  # placeholder probability
+        pred = 1 if prob >= 0.5 else 0
+        results.append({"file": fn, "pred": int(pred), "prob": float(prob)})
+    return results
+
+# ---- Label map builder ----
+def read_labels_csv(csv_path: str) -> Dict[str,int]:
+    """
+    CSV expected format (file,label) with or without header.
+    label should be 0/1 where 1 means tampered.
+    """
+    import csv
+    d = {}
+    with open(csv_path, newline='') as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row: 
+                continue
+            if len(row) == 1:
+                # single column? ignore
+                continue
+            fname = row[0].strip()
+            lab = row[1].strip()
+            try:
+                lab_i = int(float(lab))
+            except:
+                lab_i = 1 if lab.lower() in ("tampered","tp","1","t","true") else 0
+            d[fname] = lab_i
+    return d
+
+def infer_labels_from_dataset(dataset_root: str) -> Dict[str,int]:
+    """
+    Heuristic: scan subfolders for common tampered/authentic names and map file->label.
+    """
+    candidates = ["Tp","Gt","tampered","authentic","tampered_images","real","tampered_test","tampered_set"]
+    d = {}
+    dataset_root = Path(dataset_root)
+    if not dataset_root.exists():
+        return d
+    for sub in dataset_root.rglob("*"):
+        if sub.is_dir() and sub.name in candidates:
+            label = 1 if sub.name.lower() in ("tp","tampered","tampered_images","tampered_test","tampered_set") else 0
+            for img in sub.glob("*"):
+                if img.suffix.lower() in (".png",".jpg",".jpeg"):
+                    d[img.name] = label
+    return d
+
+# ---- Evaluation ----
+def evaluate_predictions(list_of_dicts: List[Dict], label_map: Dict[str,int]):
+    y_true, y_pred, y_score = [], [], []
+    for r in list_of_dicts:
+        fname = r["file"]
+        if fname not in label_map:
+            continue
+        y_true.append(int(label_map[fname]))
+        y_pred.append(int(r["pred"]))
+        y_score.append(float(r["prob"]))
+    if len(y_true) == 0:
+        return {"n":0, "accuracy": None, "f1": None, "recall_tampered": None, "auc": None}
+    acc = accuracy_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    recall_tampered = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
+    auc = safe_auc(y_true, y_score)
+    return {"n": len(y_true), "accuracy": float(acc), "f1": float(f1), "recall_tampered": float(recall_tampered), "auc": auc}
+
+# ---- Main pipeline ----
+def main(args):
+    dev = device()
+    print("[info] device:", dev)
+    # Load ckpts (best-effort)
+    restore_info = load_restoration_model(args.restore_ckpt, dev) if args.restore_ckpt else None
+    vgg_info = load_vgg_model(args.vgg_ckpt, dev) if args.vgg_ckpt else None
+
+    # Step 1: run restoration
+    ensured_out = args.out_restored
+    ensure_dir(ensured_out)
+    restored_files = run_restoration_inference(args.input_folder, ensured_out, restore_info)
+
+    # Step 2: run classifier on restored and raw
+    restored_results = predict_folder_with_vgg(vgg_info, ensured_out)
+    raw_results = predict_folder_with_vgg(vgg_info, args.input_folder)
+
+    # Save per-image jsons
+    ensure_dir("results")
+    out_compare = {"restored": restored_results, "raw": raw_results}
+    with open(args.out_json or "results/phase2_classification_compare.json", "w") as f:
+        json.dump(out_compare, f, indent=2)
+    print("[info] predictions saved")
+
+    # Step 3: build label_map
+    label_map = {}
+    if args.labels_csv and os.path.exists(args.labels_csv):
+        print(f"[info] loading labels from CSV {args.labels_csv}")
+        label_map = read_labels_csv(args.labels_csv)
+    else:
+        # try dataset root heuristics
+        ds_root = args.dataset_root or os.path.dirname(args.input_folder)
+        print(f"[info] inferring labels heuristically from {ds_root}")
+        label_map = infer_labels_from_dataset(ds_root)
+    print(f"[info] labels found for {len(label_map)} files")
+
+    # Step 4: evaluate
+    restored_eval = evaluate_predictions(restored_results, label_map)
+    raw_eval = evaluate_predictions(raw_results, label_map)
+
+    summary = {"restored": restored_eval, "raw": raw_eval}
+    with open(args.out_eval or "results/phase2_eval_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    print("[info] evaluation summary saved ->", args.out_eval or "results/phase2_eval_summary.json")
+    print(json.dumps(summary, indent=2))
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--restore-ckpt", type=str, default="restoration_best_pretrain.pt")
+    p.add_argument("--vgg-ckpt", type=str, default="vgg16_baseline.pt")
+    p.add_argument("--input-folder", type=str, required=True, help="folder with images to restore/classify")
+    p.add_argument("--out-restored", type=str, default="results/restored_pass")
+    p.add_argument("--labels-csv", dest="labels_csv", type=str, default=None, help="optional CSV file with file,label")
+    p.add_argument("--dataset-root", dest="dataset_root", type=str, default=None, help="dataset root to attempt to infer labels")
+    p.add_argument("--out-json", dest="out_json", type=str, default=None)
+    p.add_argument("--out-eval", dest="out_eval", type=str, default=None)
+    args = p.parse_args()
+    main(args)
